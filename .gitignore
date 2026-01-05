@@ -1,0 +1,27 @@
+# --- Recipe Log private/local data ---
+data/
+*.json
+
+# --- Python virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+
+# --- OS/editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Streamlit ---
+.streamlit/
+
+# --- Logs ---
+*.log
+
+# --- Other ---
+hidden/
