@@ -11,6 +11,8 @@ import uuid
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+import shutil
+
 
 import streamlit as st
 
@@ -593,6 +595,82 @@ def photos_for_cook(db: Dict[str, Any], cook_entry_id: str) -> List[Dict[str, An
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items
 
+def delete_recipe_and_assets(db: Dict[str, Any], rid: str) -> None:
+    """
+    Permanently delete a recipe + all associated timeline entries + photo records,
+    and remove its photo folder from disk.
+    """
+    rid = (rid or "").strip()
+    if not rid:
+        return
+
+    # Collect entry ids for robustness (in case some photo records lack recipe_id)
+    deleted_entry_ids = {
+        (e.get("id") or "")
+        for e in (db.get("entries", []) or [])
+        if isinstance(e, dict) and e.get("recipe_id") == rid
+    }
+
+    # Remove timeline entries for this recipe
+    db["entries"] = [
+        e for e in (db.get("entries", []) or [])
+        if isinstance(e, dict) and e.get("recipe_id") != rid
+    ]
+
+    # Remove photo records for this recipe (or attached to its deleted entries)
+    db["photos"] = [
+        p for p in (db.get("photos", []) or [])
+        if isinstance(p, dict)
+        and p.get("recipe_id") != rid
+        and (p.get("cook_entry_id") or "") not in deleted_entry_ids
+    ]
+
+    # Remove the recipe itself
+    if "recipes" in db and isinstance(db["recipes"], dict):
+        db["recipes"].pop(rid, None)
+
+    # Delete photo directory on disk: data/photos/<rid>/
+    try:
+        ensure_dirs()
+        folder = PHOTOS_DIR / rid
+        if folder.exists():
+            shutil.rmtree(folder)
+    except Exception:
+        # Best-effort cleanup; DB deletion still succeeds
+        pass
+
+def render_advanced_delete_recipe(db: Dict[str, Any], rid: str, recipe_name: str) -> None:
+    """Subtle, guarded delete UI (placed at bottom of New entry tab)."""
+    st.divider()
+    with st.expander("Advanced options", expanded=False):
+        st.caption("Delete this recipe (irreversible). This removes its notebook entries and photos too.")
+
+        confirm = st.checkbox("I understand", key=f"adv_del_ok_{rid}")
+        typed = st.text_input("Type DELETE to confirm", key=f"adv_del_type_{rid}")
+
+        can_delete = confirm and (typed or "").strip().upper() == "DELETE"
+        if st.button(
+            "Delete recipe",
+            key=f"adv_del_btn_{rid}",
+            disabled=not can_delete,
+            type="secondary",
+            use_container_width=True,
+        ):
+            delete_recipe_and_assets(db, rid)
+            save_db(db)
+
+            remaining = sorted_recipes(db)
+            st.session_state.pop("lib_current_id", None)
+            st.session_state.pop("lib_focus_id", None)
+
+            if remaining:
+                st.session_state["lib_focus_id"] = remaining[0][0]
+                st.session_state["_page_request"] = "Library"
+            else:
+                st.session_state["_page_request"] = "Add recipe"
+
+            st.rerun()
+
 
 # =============================================================================
 # Migration / normalization
@@ -794,36 +872,80 @@ def page_add_recipe(db: Dict[str, Any]) -> None:
         instructions = st.text_area("Steps / method", height=240)
         submitted = st.form_submit_button("Save recipe")
 
-    if not submitted:
-        return
-    if not name.strip():
-        st.error("Name is required.")
-        return
+    # ---- Handle recipe creation (but DO NOT early-return the page) ----
+    if submitted:
+        if not name.strip():
+            st.error("Name is required.")
+        else:
+            rid = new_id()
+            created = now_iso()
+            recipe = ensure_recipe(
+                {
+                    "id": rid,
+                    "name": name.strip(),
+                    "source": source.strip(),
+                    "ingredients": ingredients.rstrip(),
+                    "instructions": instructions.rstrip(),
+                    "created_at": created,
+                    "updated_at": created,
+                    "versions": [],
+                    "variations": [],
+                }
+            )
+            recipe["original"] = make_original_snapshot(recipe)
 
-    rid = new_id()
-    created = now_iso()
-    recipe = ensure_recipe(
-        {
-            "id": rid,
-            "name": name.strip(),
-            "source": source.strip(),
-            "ingredients": ingredients.rstrip(),
-            "instructions": instructions.rstrip(),
-            "created_at": created,
-            "updated_at": created,
-            "versions": [],
-            "variations": [],
-        }
-    )
-    recipe["original"] = make_original_snapshot(recipe)
+            db["recipes"][rid] = recipe
+            save_db(db)
 
-    db["recipes"][rid] = recipe
-    save_db(db)
+            st.session_state["lib_focus_id"] = rid
+            st.session_state["_page_request"] = "Library"
+            st.success("Saved.")
+            st.rerun()
 
-    st.session_state["lib_focus_id"] = rid
-    st.session_state["_page_request"] = "Library"
-    st.success("Saved.")
-    st.rerun()
+    # ---------------------------------------------------------------------
+    # Advanced: delete a recipe (subtle + out of the way)
+    # ---------------------------------------------------------------------
+    st.divider()
+    with st.expander("Advanced options", expanded=False):
+        st.caption("Delete an existing recipe and all associated entries (irreversible).")
+
+        items = sorted_recipes(db)
+        if not items:
+            st.caption("No recipes to delete yet.")
+        else:
+            labels = build_recipe_labels(items)
+            labels_list = list(labels.keys())
+
+            pick = st.selectbox(
+                "Recipe",
+                labels_list,
+                index=0,
+                key="addpage_delete_pick",
+            )
+            rid_del = labels.get(pick, "")
+
+            confirm = st.checkbox("I understand", key="addpage_delete_ok")
+            typed = st.text_input("Type DELETE to confirm", key="addpage_delete_type")
+
+            can_delete = confirm and (typed or "").strip().upper() == "DELETE"
+            if st.button(
+                "Delete recipe",
+                key="addpage_delete_btn",
+                disabled=not can_delete,
+                type="secondary",
+                use_container_width=True,
+            ):
+                delete_recipe_and_assets(db, rid_del)
+                save_db(db)
+
+                remaining = sorted_recipes(db)
+                if remaining:
+                    st.session_state["lib_focus_id"] = remaining[0][0]
+                    st.session_state["_page_request"] = "Library"
+                else:
+                    st.session_state["_page_request"] = "Add recipe"
+
+                st.rerun()
 
 
 def tab_original_recipe(recipe: Dict[str, Any]) -> None:
@@ -979,7 +1101,6 @@ def tab_notebook(db: Dict[str, Any], rid: str, diffs_by_vid: Dict[str, Dict[str,
             # Photos (compact)
             ph = photos_for_cook(db, e.get("id", ""))
             if ph:
-                st.caption("Photos")
                 cols = st.columns(min(4, len(ph)))
                 for i, p in enumerate(ph[:8]):
                     img_path = photo_dir_for(rid) / (p.get("filename") or "")
@@ -987,7 +1108,6 @@ def tab_notebook(db: Dict[str, Any], rid: str, diffs_by_vid: Dict[str, Dict[str,
                         if img_path.exists():
                             st.image(
                                 str(img_path),
-                                caption=fmt_stamp(p.get("created_at")),
                                 width="stretch",
                             )
 
@@ -1151,6 +1271,17 @@ def tab_new_entry(db: Dict[str, Any], rid: str, recipe: Dict[str, Any]) -> None:
                     )
             else:
                 st.caption("No cooks logged yet — this will save as a standalone edit entry.")
+            
+            name = st.text_input(
+                "Name",
+                value=(recipe.get("name") or ""),
+                placeholder="Recipe name",
+            )
+            source = st.text_input(
+                "Source (optional)",
+                value=(recipe.get("source") or ""),
+                placeholder="URL or site name",
+            )
 
             thoughts = st.text_area(
                 "General thoughts",
@@ -1170,16 +1301,24 @@ def tab_new_entry(db: Dict[str, Any], rid: str, recipe: Dict[str, Any]) -> None:
             submit = st.form_submit_button("Save entry")
 
         if submit:
+
+            if not (name or "").strip():
+                st.error("Name is required.")
+                return
+
             attach_target = None
             if attach_to_last and last_cook and not last_cook.get("edited_recipe"):
                 attach_target = last_cook
 
             entry_id = new_id()  # for standalone edit entries
-
+            
             new_values = {
+                "name": name.strip(),
+                "source": (source or "").strip(),
                 "ingredients": ingredients.rstrip(),
                 "instructions": instructions.rstrip(),
             }
+
 
             # Store association metadata inside the version snapshot
             meta: Dict[str, Any] = {"associated_entry_id": (attach_target.get("id") if attach_target else entry_id)}
@@ -1471,7 +1610,6 @@ def tab_photos(db: Dict[str, Any], rid: str) -> None:
             if img_path.exists():
                 st.image(
                     str(img_path),
-                    caption=f"{fmt_stamp(p.get('created_at'))} · {p.get('original_name','')}",
                     width="stretch",
                 )
             else:
@@ -1557,7 +1695,6 @@ def page_calendar(db: Dict[str, Any]) -> None:
             if not ph:
                 st.caption("No photos for this cook.")
             else:
-                st.caption("Photos")
                 cols = st.columns(min(4, len(ph)), gap="small")
                 for i, p in enumerate(ph[:8]):
                     img_path = photo_dir_for(rid) / (p.get("filename") or "")
@@ -1565,7 +1702,6 @@ def page_calendar(db: Dict[str, Any]) -> None:
                         if img_path.exists():
                             st.image(
                                 str(img_path),
-                                caption=fmt_stamp(p.get("created_at")),
                                 width="stretch",
                             )
 
